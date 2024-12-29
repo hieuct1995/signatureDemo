@@ -38,6 +38,6 @@ baseRouter.post('/add-sign/form', uploadFields, handleAddSignImgToPdfWithForm);
 
 baseRouter.post('/add-sign/json', handleAddSignImgToPdfAsJson);
 
-baseRouter.get('/to-base64', uploadFields, handleConvertPdfOrImgToPdfBase64);
+baseRouter.post('/to-base64', uploadFields, handleConvertPdfOrImgToPdfBase64);
 
 export default baseRouter;
