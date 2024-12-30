@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import fs, { write } from 'fs';
+import fs from 'fs';
 import path from 'path';
 import { PDFDocument } from 'pdf-lib';
 import * as libre from 'libreoffice-convert';
@@ -12,6 +12,15 @@ interface signPosition {
     y: number;
     pageNum: number;
 }
+
+//Hàm check loại file ảnh:
+function identifyFileByContent(buffer: Buffer): string {
+    const content = buffer.toString('ascii', 0, 20);
+    if (content.includes('PNG')) return 'PNG';
+    if (content.includes('JFIF') || content.includes('Exif')) return 'JPG';
+    return 'Unknown';
+}
+
 
 //Chuyển file docx sang dạng pdf buffer:
 export const convertDocxToPdfBuffer = async (pathOfDocFile: string): Promise<Buffer> => {
@@ -54,24 +63,66 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
         let signNameWidth = 0;
         let signNameHeight = 0;
         const isMainSign = signType == 1;
+        
+        let currentText = ''; // Lưu trữ tạm thời các phần tên đang được ghép
+        let startX: number = 0; 
+        let startY: number = 0;
+        let signTempWidth = 0; //Độ rộng tạm thời của phần tên
 
         for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-            const page = await pdf.getPage(pageNum);
 
+            const page = await pdf.getPage(pageNum);
             const textContent = await page.getTextContent(); // trả về đối tượng chứa các items và styles
-            textContent.items.forEach((item: Record<string, any>) => {
+            textContent.items.forEach((item: Record<string, any>,) => {
                 const text: string = item.str;
+
                 if (text == './.') {
                     endBody = true;
                 }
                 const transform: number[] = item.transform;
-                if (endBody && text.includes(signName)) {
-                    const x = transform[4];
-                    const y = transform[5];
-                    signNameWidth = item.width;
-                    signNameHeight = item.height;
-                    hasSignName = true;
-                    signPosition = { x, y, pageNum };
+                if (endBody) {
+                    if (text == signName) {
+                        // Trường hợp khớp hoàn toàn
+                        const x = transform[4];
+                        const y = transform[5];
+                        signNameWidth = item.width;
+                        signNameHeight = item.height;
+                        hasSignName = true;
+                        signPosition = { x, y, pageNum };
+
+                    } else if (signName.startsWith(currentText + text)) {
+                        // Trường hợp chưa khớp hoàn toàn
+                        if (!currentText) {
+                            startX = transform[4];
+                            startY = transform[5];
+                        }
+                        currentText += text;
+                        signTempWidth += item.width;
+
+                        // Nếu ghép đủ và khớp hoàn toàn với signName
+                        if (currentText === signName) {
+                            signNameWidth = signTempWidth;
+                            signNameHeight = item.height;
+                            hasSignName = true;
+
+                            signPosition = {
+                                x: startX,
+                                y: startY,
+                                pageNum,
+                            };
+
+                            currentText = '';
+                            startX = 0;
+                            startY = 0;
+                        }
+                    } else {
+                        if (currentText) {
+                            console.log(`Chuỗi ghép dở bị gián đoạn: ${currentText} + ${text}`);
+                        }
+                        currentText = '';
+                        startX = 0;
+                        startY = 0;
+                    }
                 }
             });
 
@@ -95,7 +146,9 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
 
         const pdfDoc = await PDFDocument.load(pdfBuffer); // đối tượng PDFDocument
 
-        const signatureImage = await pdfDoc.embedPng(signImgBuffer);
+        const typeImg = identifyFileByContent(signImgBuffer);
+
+        const signatureImage = typeImg == 'PNG' ? await pdfDoc.embedPng(signImgBuffer) : await pdfDoc.embedJpg(signImgBuffer) 
 
         const { x, y, pageNum } = signPosition;
         //pdf-lib đánh số trang từ 0:
