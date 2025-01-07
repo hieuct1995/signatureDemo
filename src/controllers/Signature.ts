@@ -5,6 +5,7 @@ import AdmZip from 'adm-zip';
 import { PDFDocument } from 'pdf-lib';
 import * as libre from 'libreoffice-convert';
 import { readFile } from '../utils/fileUtil';
+import { TextItem } from 'pdfjs-dist/types/src/display/api';
 
 const rootPath = process.env.ROOT_PATH || "";
 
@@ -96,20 +97,42 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
         let startY: number = 0;
         let signTempWidth = 0; //Độ rộng tạm thời của phần tên
 
+        // Hàm kiểm tra phần text tiếp theo:
+        function checkNextText(index: number, items: TextItem[], expectedText: string): boolean {
+            if (index + 1 < items.length) {
+                const nextText: string = items[index + 1].str || "";
+                return nextText.trim() === expectedText;
+            }
+            return false;
+        }
+
         for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
 
             const page = await pdf.getPage(pageNum);
             const textContent = await page.getTextContent(); // trả về đối tượng chứa các items và styles
-            textContent.items.forEach((item: Record<string, any>) => {
+            const items = textContent.items as TextItem[] || [];
+            items.forEach((item: TextItem, index: number) => {
                 const text: string = item.str || "";
                 if (text == "") return;
-                if (text == "./." || text.endsWith("./.")) {
-                    endBody = true;
+                const szTrimText = text.trim();
+                //Nếu chưa thấy dấu kết thúc ./. , đi tìm dấu kết thúc:
+                if (!endBody) {
+                    if (szTrimText == "./." || szTrimText.endsWith("./.")) {
+                        endBody = true;
+                    } else if (szTrimText.endsWith("./") && checkNextText(index, items, ".")) {
+                        endBody = true;
+                    } else if (szTrimText.endsWith(".") && checkNextText(index, items, "/.")) {
+                        endBody = true;
+                    } else if (szTrimText.endsWith(".") && checkNextText(index, items, "/")) {
+                        if (index + 2 < items.length && checkNextText(index + 1, items, ".")) {
+                            endBody = true;
+                        }
+                    }
                 }
-                const transform: number[] = item.transform;
+                //Nếu đã thấy dấu kết thúc ./. , đi tìm chữ ký:
                 if (endBody) {
-
-                    if (text.trim() == signName) {
+                    const transform: number[] = item.transform;
+                    if (szTrimText == signName) {
                         // Trường hợp khớp hoàn toàn
                         const x = transform[4];
                         const y = transform[5];
@@ -230,11 +253,11 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
 // Hàm thêm ảnh vào file pdf, hoặc docx cho API trả về JSON base64:
 export const handleAddSignImgToPdfAsJson = async (req: Request, res: Response) => {
 
-    const {dataBase64, signImgBase64, signName, signType } = req.body;
+    const { dataBase64, signImgBase64, signName, signType } = req.body;
     try {
         const dataBuffer = Buffer.from(dataBase64, 'base64');
         const fileType = detectFileType(dataBase64);
-        if (fileType == "UNKNOWN") {
+        if (!["PDF", "DOCX"].includes(fileType)) {
             res.status(400).json({
                 success: false,
                 message: "Dữ liệu file truyền lên không phải định dạng PDF hoặc DOCX",
