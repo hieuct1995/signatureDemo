@@ -69,7 +69,7 @@ npm run dev (with nodemon)
 
 | Parameter | Type     | Description                    |
 | :-------- | :------- | :------------------------------|
-| `pdfBase64` | `string` | **Required**. Base64 PDF data |
+| `dataBase64` | `string` | **Required**. Base64 PDF or DOCX data |
 | `signImgBase64` | `string` | **Required**. Base64 signature image |
 | `signName` | `string` | **Required**. Name of the signer|
 | `signType` | `number` | **Required**. Type of signature (1 for main, 0 for secondary)|
@@ -83,4 +83,4 @@ npm run dev (with nodemon)
 
 | Parameter | Type     | Description                    |
 | :-------- | :------- | :------------------------------|
-| `file`    | `file`   | **Required**. PDF or IMG file |
+| `file`    | `file`   | **Required**. PDF, DOCX or IMG file |

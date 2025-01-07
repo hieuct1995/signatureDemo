@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
+import AdmZip from 'adm-zip';
 import { PDFDocument } from 'pdf-lib';
 import * as libre from 'libreoffice-convert';
 import { readFile } from '../utils/fileUtil';
@@ -13,26 +14,52 @@ interface signPosition {
     pageNum: number;
 }
 
+//Xem có phải là docx không:
+function isDocx(buffer: Buffer): boolean {
+    try {
+        const zip = new AdmZip(buffer);
+        const entries = zip.getEntries().map(entry => entry.entryName);
+        return entries.includes('[Content_Types].xml') && entries.some(name => name.startsWith('word/'));
+    } catch (error) {
+        console.error('Error while checking DOCX file:', error);
+        return false;
+    }
+}
+
+//Hàm check loại tài liệu:
+function detectFileType(base64: string): string {
+    const binary = Buffer.from(base64, 'base64');
+    const signature = binary.toString('hex', 0, 4).toUpperCase();
+    if (signature === '25504446') {
+        return 'PDF';
+    } else if (signature === '504B0304') {
+        if (isDocx(binary)) {
+            return 'DOCX';
+        }
+        return 'ZIP';
+    }
+    return 'UNKNOWN';
+}
+
 //Hàm check loại file ảnh:
 function identifyFileByContent(buffer: Buffer): string {
     const content = buffer.toString('ascii', 0, 20);
     if (content.includes('PNG')) return 'PNG';
     if (content.includes('JFIF') || content.includes('Exif')) return 'JPG';
-    return 'Unknown';
+    return 'UNKNOWN';
 }
 
 
-//Chuyển file docx sang dạng pdf buffer:
-export const convertDocxToPdfBuffer = async (pathOfDocFile: string): Promise<Buffer> => {
+//Chuyển file docx hoặc docx buffer sang dạng pdf buffer:
+export const convertDocxToPdfBuffer = async (pathOrBuffer: { path?: string; buffer?: Buffer }): Promise<Buffer> => {
     try {
-        const dataBuffer = await readFile(pathOfDocFile);
+        const dataBuffer = pathOrBuffer.path ? await readFile(pathOrBuffer.path) : pathOrBuffer.buffer;
+        if (!dataBuffer) return Promise.reject(new Error('File not found'));
+        
         return new Promise((resolve, reject) => {
             libre.convert(dataBuffer, '.pdf', '', (err, result) => {
-                if (err) {
-                    return reject(err);
-                } else {
-                    return resolve(result);
-                }
+                if (err) return reject(err);
+                resolve(result);
             });
         });
     } catch (err) {
@@ -73,15 +100,16 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
 
             const page = await pdf.getPage(pageNum);
             const textContent = await page.getTextContent(); // trả về đối tượng chứa các items và styles
-            textContent.items.forEach((item: Record<string, any>,) => {
-                const text: string = item.str;
-
-                if (text == './.') {
+            textContent.items.forEach((item: Record<string, any>) => {
+                const text: string = item.str || "";
+                if (text == "") return;
+                if (text == "./." || text.endsWith("./.")) {
                     endBody = true;
                 }
                 const transform: number[] = item.transform;
                 if (endBody) {
-                    if (text == signName) {
+
+                    if (text.trim() == signName) {
                         // Trường hợp khớp hoàn toàn
                         const x = transform[4];
                         const y = transform[5];
@@ -98,9 +126,8 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
                         }
                         currentText += text;
                         signTempWidth += item.width;
-
                         // Nếu ghép đủ và khớp hoàn toàn với signName
-                        if (currentText === signName) {
+                        if (currentText.trim() === signName) {
                             signNameWidth = signTempWidth;
                             signNameHeight = item.height;
                             hasSignName = true;
@@ -114,6 +141,7 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
                             currentText = '';
                             startX = 0;
                             startY = 0;
+                            signTempWidth = 0;
                         }
                     } else {
                         if (currentText) {
@@ -122,6 +150,7 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
                         currentText = '';
                         startX = 0;
                         startY = 0;
+                        signTempWidth = 0;
                     }
                 }
             });
@@ -198,13 +227,33 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
     }
 }
 
-// Hàm thêm ảnh vào file pdf cho API trả về JSON:
+// Hàm thêm ảnh vào file pdf, hoặc docx cho API trả về JSON base64:
 export const handleAddSignImgToPdfAsJson = async (req: Request, res: Response) => {
 
-    const {pdfBase64, signImgBase64, signName, signType } = req.body;
+    const {dataBase64, signImgBase64, signName, signType } = req.body;
     try {
-        const pdfBuffer = Buffer.from(pdfBase64, 'base64');
+        const dataBuffer = Buffer.from(dataBase64, 'base64');
+        const fileType = detectFileType(dataBase64);
+        if (fileType == "UNKNOWN") {
+            res.status(400).json({
+                success: false,
+                message: "Dữ liệu file truyền lên không phải định dạng PDF hoặc DOCX",
+                data: dataBase64
+            })
+        }
         const signImgBuffer = Buffer.from(signImgBase64, 'base64');
+        const imgType = identifyFileByContent(signImgBuffer);
+        if (imgType == "UNKNOWN") {
+            res.status(400).json({
+                success: false,
+                message: "Dữ liệu ảnh truyền lên không phải định dạng PNG hoặc JPG",
+                data: dataBase64
+            })
+        }
+
+        //Chuyển sang dạn pdfBuffer trước nếu là file docx:
+        const pdfBuffer = fileType == "DOCX" ? await convertDocxToPdfBuffer({ buffer: dataBuffer }) : dataBuffer;
+
         const pdfDataAfterAddSign = await addSignImgToPdf(pdfBuffer, signImgBuffer, signName, signType);
         const { success, message, data } = pdfDataAfterAddSign;
         if (success) {
@@ -217,17 +266,17 @@ export const handleAddSignImgToPdfAsJson = async (req: Request, res: Response) =
             });
             return;
         }
-        res.json({
+        res.status(404).json({
             success,
             message,
-            data: pdfBase64
+            data: dataBase64
         });
     } catch (error) {
         console.error('Có lỗi xảy ra:', error);
         res.status(500).json({ 
             success: false, 
-            message: 'Có lỗi xảy ta',
-            data: pdfBase64
+            message: 'Có lỗi xảy ra',
+            data: dataBase64
         });
     }
 };
@@ -253,7 +302,7 @@ export const handleAddSignImgToPdfWithForm = async (req: Request, res: Response)
         }
 
         const signatureImageBuffer = await readFile(pathOfSignatureImage);
-        const pdfBuffer = isDocxFile ? await convertDocxToPdfBuffer(pathOfDocFile) : await readFile(pathOfDocFile);
+        const pdfBuffer = isDocxFile ? await convertDocxToPdfBuffer({ path: pathOfDocFile }) : await readFile(pathOfDocFile);
 
         //Thêm ảnh vào file PDF:
         const pdfDataAfterAddSign = await addSignImgToPdf(pdfBuffer, signatureImageBuffer, signName, signType);
@@ -274,7 +323,7 @@ export const handleAddSignImgToPdfWithForm = async (req: Request, res: Response)
         fs.writeFileSync(outputPdfPath, pdfBytes);
 
         res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename=${namePdfSigned}`);
+        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(namePdfSigned)}`);
         return res.sendFile(outputPdfPath);
     } catch (error) {
         console.error('Lỗi:', error);
