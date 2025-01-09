@@ -1,11 +1,15 @@
 import { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
-import AdmZip from 'adm-zip';
 import { PDFDocument } from 'pdf-lib';
-import * as libre from 'libreoffice-convert';
-import { readFile } from '../utils/fileUtil';
 import { TextItem } from 'pdfjs-dist/types/src/display/api';
+import {
+    readFile,
+    convertDocxToPdfBuffer,
+    detectFileType,
+    identifyFileByContent,
+    removeBackgroundFromBuffer
+} from '../utils/fileUtil';
 
 const rootPath = process.env.ROOT_PATH || "";
 
@@ -15,63 +19,9 @@ interface signPosition {
     pageNum: number;
 }
 
-//Xem có phải là docx không:
-function isDocx(buffer: Buffer): boolean {
-    try {
-        const zip = new AdmZip(buffer);
-        const entries = zip.getEntries().map(entry => entry.entryName);
-        return entries.includes('[Content_Types].xml') && entries.some(name => name.startsWith('word/'));
-    } catch (error) {
-        console.error('Error while checking DOCX file:', error);
-        return false;
-    }
-}
-
-//Hàm check loại tài liệu:
-function detectFileType(base64: string): string {
-    const binary = Buffer.from(base64, 'base64');
-    const signature = binary.toString('hex', 0, 4).toUpperCase();
-    if (signature === '25504446') {
-        return 'PDF';
-    } else if (signature === '504B0304') {
-        if (isDocx(binary)) {
-            return 'DOCX';
-        }
-        return 'ZIP';
-    }
-    return 'UNKNOWN';
-}
-
-//Hàm check loại file ảnh:
-function identifyFileByContent(buffer: Buffer): string {
-    const content = buffer.toString('ascii', 0, 20);
-    if (content.includes('PNG')) return 'PNG';
-    if (content.includes('JFIF') || content.includes('Exif')) return 'JPG';
-    return 'UNKNOWN';
-}
-
-
-//Chuyển file docx hoặc docx buffer sang dạng pdf buffer:
-export const convertDocxToPdfBuffer = async (pathOrBuffer: { path?: string; buffer?: Buffer }): Promise<Buffer> => {
-    try {
-        const dataBuffer = pathOrBuffer.path ? await readFile(pathOrBuffer.path) : pathOrBuffer.buffer;
-        if (!dataBuffer) return Promise.reject(new Error('File not found'));
-        
-        return new Promise((resolve, reject) => {
-            libre.convert(dataBuffer, '.pdf', '', (err, result) => {
-                if (err) return reject(err);
-                resolve(result);
-            });
-        });
-    } catch (err) {
-        console.error('Error reading file:', err);
-        return Promise.reject(err);
-    }
-};
-
 
 // Import lib pdfjs-dist và trả về đối tượng chứa thông tin file:
-export const getTextFromPDF = async ( pdfBuffer: Buffer) => {
+export const getTextFromPDF = async (pdfBuffer: Buffer) => {
 
     const pdfjsLib = await import('pdfjs-dist');
     const loadingTask = pdfjsLib.getDocument({ data: pdfBuffer }); //tải tài liệu
@@ -81,7 +31,7 @@ export const getTextFromPDF = async ( pdfBuffer: Buffer) => {
 
 
 // Hàm thêm ảnh vào file pdf:
-export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, signName: string, signType: number) {
+export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, signName: string, signType: number, imgType: string) {
     try {
         const pdf = await getTextFromPDF(pdfBuffer);
 
@@ -91,9 +41,9 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
         let signNameWidth = 0;
         let signNameHeight = 0;
         const isMainSign = signType == 1;
-        
+
         let currentText = ''; // Lưu trữ tạm thời các phần tên đang được ghép
-        let startX: number = 0; 
+        let startX: number = 0;
         let startY: number = 0;
         let signTempWidth = 0; //Độ rộng tạm thời của phần tên
 
@@ -198,22 +148,22 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
 
         const pdfDoc = await PDFDocument.load(pdfBuffer); // đối tượng PDFDocument
 
-        const typeImg = identifyFileByContent(signImgBuffer);
+        const signImgRemoveBgBuffer = await removeBackgroundFromBuffer(signImgBuffer, imgType);
 
-        const signatureImage = typeImg == 'PNG' ? await pdfDoc.embedPng(signImgBuffer) : await pdfDoc.embedJpg(signImgBuffer) 
+        const signatureImage = imgType == 'PNG' ? await pdfDoc.embedPng(signImgRemoveBgBuffer) : await pdfDoc.embedJpg(signImgRemoveBgBuffer)
 
         const { x, y, pageNum } = signPosition;
         //pdf-lib đánh số trang từ 0:
         const page = pdfDoc.getPage(pageNum - 1);
 
-        const signatureWidth = 120;
-        const signatureHeight = 50;
+        const signatureWidth = isMainSign ? 120 : 60;
+        const signatureHeight = isMainSign ? 50 : 25;
 
         //Nếu là ký chính, chèn ảnh lên trên tên người ký:
         if (isMainSign) {
             const moveUpFromSignName = signNameHeight + 10;
             const moveX = (signatureWidth - signNameWidth) / 2;
-    
+
             page.drawImage(signatureImage, {
                 x: x - moveX,
                 y: y + moveUpFromSignName,
@@ -222,10 +172,10 @@ export async function addSignImgToPdf(pdfBuffer: Buffer, signImgBuffer: Buffer, 
             });
         } else {
             //Nếu là ký nháy chèn ảnh ký sang phải tên người ký:
-            const moveUpFromSignName = signNameWidth + 10;
+            const moveRightFromSignName = signNameWidth + 10;
             const moveY = (signatureHeight - signNameHeight) / 2;
             page.drawImage(signatureImage, {
-                x: x + moveUpFromSignName,
+                x: x + moveRightFromSignName,
                 y: y - moveY,
                 width: signatureWidth,
                 height: signatureHeight,
@@ -277,7 +227,7 @@ export const handleAddSignImgToPdfAsJson = async (req: Request, res: Response) =
         //Chuyển sang dạn pdfBuffer trước nếu là file docx:
         const pdfBuffer = fileType == "DOCX" ? await convertDocxToPdfBuffer({ buffer: dataBuffer }) : dataBuffer;
 
-        const pdfDataAfterAddSign = await addSignImgToPdf(pdfBuffer, signImgBuffer, signName, signType);
+        const pdfDataAfterAddSign = await addSignImgToPdf(pdfBuffer, signImgBuffer, signName, signType, imgType);
         const { success, message, data } = pdfDataAfterAddSign;
         if (success) {
             const dataBase64 = Buffer.from(data).toString('base64');
@@ -296,8 +246,8 @@ export const handleAddSignImgToPdfAsJson = async (req: Request, res: Response) =
         });
     } catch (error) {
         console.error('Có lỗi xảy ra:', error);
-        res.status(500).json({ 
-            success: false, 
+        res.status(500).json({
+            success: false,
             message: 'Có lỗi xảy ra',
             data: dataBase64
         });
@@ -313,6 +263,7 @@ export const handleAddSignImgToPdfWithForm = async (req: Request, res: Response)
         const files = req.files as { [fieldname: string]: Express.Multer.File[] };
         const docFile = files.file[0];
         const signImage = files.signatureImage[0];
+        const imgType = files.signatureImage[0].mimetype.split("/")[1].toUpperCase() || "PNG";
 
         const nameOfDocFile = docFile.originalname || "";
         const pathOfDocFile = docFile.path || "";
@@ -328,7 +279,7 @@ export const handleAddSignImgToPdfWithForm = async (req: Request, res: Response)
         const pdfBuffer = isDocxFile ? await convertDocxToPdfBuffer({ path: pathOfDocFile }) : await readFile(pathOfDocFile);
 
         //Thêm ảnh vào file PDF:
-        const pdfDataAfterAddSign = await addSignImgToPdf(pdfBuffer, signatureImageBuffer, signName, signType);
+        const pdfDataAfterAddSign = await addSignImgToPdf(pdfBuffer, signatureImageBuffer, signName, signType, imgType);
 
         //Thêm ảnh xong xóa file tạm:
         fs.unlinkSync(pathOfDocFile);
@@ -384,15 +335,15 @@ export const handleConvertPdfOrImgToPdfBase64 = async (req: Request, res: Respon
         const pathOfPdfFile = file.path || "";
         const pdfBase64 = await convertPdfOrImgToPdfBase64(pathOfPdfFile);
         fs.unlinkSync(pathOfPdfFile);
-        res.status(200).json({ 
-            success: true, 
+        res.status(200).json({
+            success: true,
             message: 'Thành công!',
-            data: pdfBase64 
+            data: pdfBase64
         });
     } catch (error) {
         console.error('Có lỗi xảy ra:', error);
-        res.status(500).json({ 
-            success: false, 
+        res.status(500).json({
+            success: false,
             message: 'Có lỗi xảy ta',
             data: null
         });
